@@ -76,7 +76,12 @@ export default function ShaderCanvas() {
   return (
     <>
       <ShaderErrorBoundary>
-        <Canvas fallback={<Fallback2D />} frameloop={paused ? 'never' : 'always'}>
+        <Canvas
+          fallback={<Fallback2D />}
+          frameloop={paused ? 'never' : 'always'}
+          dpr={[1, 1.5]}                                   
+          gl={{ antialias: false, depth: false }}   
+        >
           <Plane />
         </Canvas>
       </ShaderErrorBoundary>
