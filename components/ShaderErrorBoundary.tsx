@@ -1,11 +1,12 @@
 'use client'
 
 import { catchError, type ErrorInfo } from 'next/error'
-import Fallback2D from './Fallback2D'
 
+// Renders nothing on error: ShaderCanvas keeps Fallback2D underneath the shader,
+// so dropping the shader (and its pause bar) leaves the static image showing
 function ShaderFallback(_props: object, { error }: ErrorInfo) {
   console.warn('Shader failed, showing static fallback:', error)
-  return <Fallback2D />
+  return null
 }
 
 export default catchError(ShaderFallback)

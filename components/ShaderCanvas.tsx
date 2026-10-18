@@ -1,7 +1,7 @@
 'use client'
 
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { Canvas, useFrame } from '@react-three/fiber'
+import { Canvas, useFrame, useThree } from '@react-three/fiber'
 import { Vector2, type ShaderMaterial } from 'three'
 import Fallback2D from '@/components/Fallback2D'
 import ShaderErrorBoundary from '@/components/ShaderErrorBoundary'
@@ -21,6 +21,7 @@ const fragmentShader = `
   uniform vec2 uMouse;
   uniform float uAspect;
   uniform float uHover;
+  uniform float uGrain;
   varying vec2 vUv;
 
   // Spiral twist around center: rotation angle is largest at center and fades
@@ -43,7 +44,7 @@ const fragmentShader = `
 
   // Soft blob: solid core, then fades smoothly to 0 at radius
   float blob(vec2 p, vec2 center, float radius) {
-    return 1.0 - smoothstep(radius * 0.2, radius, length(p - center));
+    return 1.0 - smoothstep(radius * 0.45, radius, length(p - center));
   }
 
   float hash(vec2 p) {
@@ -56,26 +57,27 @@ const fragmentShader = `
     vec2 p = vUv * aspect;
     vec2 mouse = uMouse * aspect;
 
-    // Twist the whole space around the mouse, white areas included
+    // Twist the whole space around the mouse, empty areas included
     p = swirl(p, mouse, uHover);
 
     // Positions are in 0..1 screen units (y up), then scaled like p
-    vec2 blueCenter = (vec2(0.2, 0.6) + drift(0.0, uTime)) * aspect;
-    vec2 pinkCenter = (vec2(0.28, 0.12) + drift(4.0, uTime)) * aspect;
+    vec2 mossCenter = (vec2(0.22, 0.65) + drift(0.0, uTime)) * aspect;
+    vec2 blueCenter = (vec2(0.55, 0.2) + drift(4.0, uTime)) * aspect;
+    vec2 pinkCenter = (vec2(0.82, 0.68) + drift(8.0, uTime)) * aspect;
 
-    vec3 blue = vec3(0.25, 0.4, 0.88);
-    vec3 pink = vec3(0.82, 0.45, 0.85);
+    vec3 background = vec3(254.0, 250.0, 243.0) / 255.0;  // #FEFAF3
+    vec3 pink = vec3(242.0, 145.0, 145.0) / 255.0;        // #F29191
+    vec3 blue = vec3(103.0, 162.0, 197.0) / 255.0;        // #67A2C5
+    vec3 moss = vec3(132.0, 162.0, 130.0) / 255.0;        // #84A282
 
-    vec3 color = vec3(1.0);
-    color = mix(color, pink, blob(p, pinkCenter, 0.55) * 0.85);
-    color = mix(color, blue, blob(p, blueCenter, 0.5) * 0.95);
-
-    // Light grey vignette toward the screen edges
-    float edge = length(vUv - 0.5);
-    color *= 1.0 - 0.09 * smoothstep(0.3, 0.75, edge);
+    // Plain mix, so each blob's core is exactly its palette colour
+    vec3 color = background;
+    color = mix(color, blue, blob(p, blueCenter, 0.45));
+    color = mix(color, pink, blob(p, pinkCenter, 0.35));
+    color = mix(color, moss, blob(p, mossCenter, 0.42));
 
     float grain = hash(gl_FragCoord.xy + fract(uTime) * 100.0) - 0.5;
-    color += grain * 0.06;
+    color += grain * uGrain;
 
     gl_FragColor = vec4(color, 1.0);
   }
@@ -85,10 +87,22 @@ const fragmentShader = `
 const MOUSE_FOLLOW_SPEED = 5
 // Higher = swirl appears/fades faster when the pointer enters/leaves
 const HOVER_FADE_SPEED = 2
+// Grain strength. Moving grain averages out to a light film texture, but frozen
+// grain looks much harsher, so a still frame gets a lighter dose
+const GRAIN_MOVING = 0.06
+const GRAIN_STILL = 0.025
 
-function Plane() {
+function Plane({ paused, onFirstFrame }: { paused: boolean; onFirstFrame: () => void }) {
   const materialRef = useRef<ShaderMaterial>(null)
   const pointerInside = useRef(false)
+  const hasRendered = useRef(false)
+  const invalidate = useThree((state) => state.invalidate)
+
+  // With frameloop="demand", draw one more frame on pause, with time frozen
+  // and the lighter still-frame grain
+  useEffect(() => {
+    if (paused) invalidate()
+  }, [paused, invalidate])
 
   useEffect(() => {
     const root = document.documentElement
@@ -109,6 +123,7 @@ function Plane() {
       uMouse: { value: new Vector2(0.5, 0.5) },
       uAspect: { value: 1 },
       uHover: { value: 0 },
+      uGrain: { value: GRAIN_MOVING },
     }),
     []
   )
@@ -116,10 +131,12 @@ function Plane() {
   useFrame((state, delta) => {
     if (!materialRef.current) return
 
-    const dt = Math.min(delta, 0.1)
+    // Paused frames (pause itself, resizes) keep everything where it was
+    const dt = paused ? 0 : Math.min(delta, 0.1)
     const u = materialRef.current.uniforms
     u.uTime.value += dt
     u.uAspect.value = state.size.width / state.size.height
+    u.uGrain.value = paused ? GRAIN_STILL : GRAIN_MOVING
 
     const hoverTarget = pointerInside.current ? 1 : 0
     u.uHover.value += (hoverTarget - u.uHover.value) * (1 - Math.exp(-dt * HOVER_FADE_SPEED))
@@ -130,6 +147,11 @@ function Plane() {
     const ease = u.uHover.value < 0.01 ? 1 : 1 - Math.exp(-dt * MOUSE_FOLLOW_SPEED)
     mouse.x += (state.pointer.x * 0.5 + 0.5 - mouse.x) * ease
     mouse.y += (state.pointer.y * 0.5 + 0.5 - mouse.y) * ease
+
+    if (!hasRendered.current) {
+      hasRendered.current = true
+      onFirstFrame()
+    }
   })
 
   return (
@@ -148,29 +170,54 @@ function Plane() {
 export default function ShaderCanvas() {
   const reduceMotion = usePrefersReducedMotion()
   const [paused, setPaused] = useState(false)
+  // Shader has drawn its first frame: fade it in over the fallback
+  const [ready, setReady] = useState(false)
+  // WebGL context was lost mid-session (GPU reset, too many tabs): drop the shader
+  const [contextLost, setContextLost] = useState(false)
 
-  if (reduceMotion) return <Fallback2D />
-
+  // Fallback2D always stays underneath at the same tree position, so it is never
+  // remounted: it is the first paint (SSR), the reduced-motion view, and what
+  // shows if the shader fails or loses its context. The background colour
+  // covers the moment before it first draws.
   return (
-    <>
-      <ShaderErrorBoundary>
-        <Canvas
-          fallback={<Fallback2D />}
-          frameloop={paused ? 'never' : 'always'}
-          dpr={[1, 1.5]}
-          gl={{ antialias: false, depth: false }}
-        >
-          <Plane />
-        </Canvas>
-      </ShaderErrorBoundary>
-      <button
-        type="button"
-        onClick={() => setPaused(!paused)}
-        aria-label={paused ? 'Play animation' : 'Pause animation'}
-        className="fixed right-4 bottom-4 rounded-full bg-neutral-900/85 px-4 py-2 text-sm text-white shadow-md"
-      >
-        {paused ? '▶ Play' : '⏸ Pause'}
-      </button>
-    </>
+    <div className="relative h-full bg-[#FEFAF3]">
+      <div className="absolute inset-0">
+        <Fallback2D />
+      </div>
+      {!reduceMotion && !contextLost && (
+        // On error the boundary renders nothing, removing the shader and the
+        // pause bar together, so the bar never shows without an animation
+        <ShaderErrorBoundary>
+          <div
+            className={`absolute inset-0 transition-opacity duration-700 ${ready ? 'opacity-100' : 'opacity-0'}`}
+          >
+            <Canvas
+              fallback={<Fallback2D />}
+              frameloop={paused ? 'demand' : 'always'}
+              dpr={[1, 1.5]}
+              gl={{ antialias: false, depth: false }}
+              onCreated={({ gl }) => {
+                gl.domElement.addEventListener('webglcontextlost', () => setContextLost(true), {
+                  once: true,
+                })
+              }}
+            >
+              <Plane paused={paused} onFirstFrame={() => setReady(true)} />
+            </Canvas>
+          </div>
+          <div className="fixed right-4 bottom-4 flex items-center gap-3 rounded-full bg-white py-1.5 pr-1.5 pl-4 text-sm shadow-md">
+            <span className="text-neutral-600">Background animation</span>
+            <button
+              type="button"
+              onClick={() => setPaused(!paused)}
+              aria-label={paused ? 'Play background animation' : 'Pause background animation'}
+              className="w-24 rounded-full bg-neutral-900 py-1.5 text-center text-white"
+            >
+              {paused ? '▶ Play' : '⏸ Pause'}
+            </button>
+          </div>
+        </ShaderErrorBoundary>
+      )}
+    </div>
   )
 }
