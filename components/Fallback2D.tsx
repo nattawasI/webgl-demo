@@ -24,8 +24,8 @@ function drawBlob(
 }
 
 function draw(canvas: HTMLCanvasElement) {
-  // R3F mounts its fallback inside its own <canvas>, where it is never shown
-  // and has no size; skip drawing there (getImageData throws on 0 size)
+  // Skip while the canvas has no size (not laid out yet, or hidden):
+  // getImageData throws on 0 size
   if (!canvas.clientWidth || !canvas.clientHeight) return
 
   // Draw at device resolution so it isn't upscaled on retina screens

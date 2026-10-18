@@ -1,22 +1,29 @@
 'use client'
 
-import { useEffect, useMemo, useRef, useState } from 'react'
-import { Canvas, useFrame, useThree } from '@react-three/fiber'
-import { Vector2, type ShaderMaterial } from 'three'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import Fallback2D from '@/components/Fallback2D'
 import ShaderErrorBoundary from '@/components/ShaderErrorBoundary'
 import { usePrefersReducedMotion } from '@/hooks/usePrefersReducedMotion'
 
 const vertexShader = `
+  attribute vec2 position;
   varying vec2 vUv;
 
   void main() {
-    vUv = uv;
-    gl_Position = vec4(position.xy, 0.0, 1.0);
+    vUv = position * 0.5 + 0.5;
+    gl_Position = vec4(position, 0.0, 1.0);
   }
 `
 
 const fragmentShader = `
+  // highp where available: at mediump (16-bit on many phones) the grain hash
+  // loses precision and turns into visible patterns
+  #ifdef GL_FRAGMENT_PRECISION_HIGH
+    precision highp float;
+  #else
+    precision mediump float;
+  #endif
+
   uniform float uTime;
   uniform vec2 uMouse;
   uniform float uAspect;
@@ -91,131 +98,246 @@ const HOVER_FADE_SPEED = 2
 // grain looks much harsher, so a still frame gets a lighter dose
 const GRAIN_MOVING = 0.06
 const GRAIN_STILL = 0.025
+// Device pixel ratio cap, to keep GPU load down on retina screens
+const MAX_DPR = 1.5
 
-function Plane({ paused, onFirstFrame }: { paused: boolean; onFirstFrame: () => void }) {
-  const materialRef = useRef<ShaderMaterial>(null)
-  const pointerInside = useRef(false)
-  const hasRendered = useRef(false)
-  const invalidate = useThree((state) => state.invalidate)
+function compile(gl: WebGLRenderingContext, type: number, source: string) {
+  const shader = gl.createShader(type)
+  if (!shader) return null
+  gl.shaderSource(shader, source)
+  gl.compileShader(shader)
+  if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+    console.warn('ShaderCanvas: shader failed to compile', gl.getShaderInfoLog(shader))
+    gl.deleteShader(shader)
+    return null
+  }
+  return shader
+}
 
-  // With frameloop="demand", draw one more frame on pause, with time frozen
-  // and the lighter still-frame grain
+// The WebGL canvas and its pause bar. Calls onFail (no WebGL, shader compile
+// error, context lost) so the parent can drop it and leave Fallback2D showing.
+function ShaderLayer({
+  paused,
+  onTogglePause,
+  onFail,
+}: {
+  paused: boolean
+  onTogglePause: () => void
+  onFail: () => void
+}) {
+  const canvasRef = useRef<HTMLCanvasElement>(null)
+  // Set by the WebGL effect; lets the paused prop reach the render loop
+  // without tearing down and rebuilding the GL setup
+  const setPausedRef = useRef<((paused: boolean) => void) | null>(null)
+  // First frame drawn: fade the canvas in over the fallback and show the bar
+  const [ready, setReady] = useState(false)
+
   useEffect(() => {
-    if (paused) invalidate()
-  }, [paused, invalidate])
+    const canvas = canvasRef.current
+    if (!canvas) return
 
-  useEffect(() => {
-    const root = document.documentElement
-    const enter = () => { pointerInside.current = true }
-    const leave = () => { pointerInside.current = false }
-    root.addEventListener('pointermove', enter)
-    root.addEventListener('pointerleave', leave)
+    const gl = canvas.getContext('webgl', {
+      antialias: false,
+      depth: false,
+      alpha: false,
+      powerPreference: 'low-power',
+    })
+    if (!gl) {
+      console.warn('ShaderCanvas: WebGL unavailable, showing static fallback')
+      onFail()
+      return
+    }
+
+    const vs = compile(gl, gl.VERTEX_SHADER, vertexShader)
+    const fs = compile(gl, gl.FRAGMENT_SHADER, fragmentShader)
+    const program = gl.createProgram()
+    if (!vs || !fs || !program) {
+      onFail()
+      return
+    }
+    gl.attachShader(program, vs)
+    gl.attachShader(program, fs)
+    gl.linkProgram(program)
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+      console.warn('ShaderCanvas: shader failed to link', gl.getProgramInfoLog(program))
+      onFail()
+      return
+    }
+    gl.useProgram(program)
+
+    // One oversized triangle that covers the whole viewport
+    const buffer = gl.createBuffer()
+    gl.bindBuffer(gl.ARRAY_BUFFER, buffer)
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW)
+    const position = gl.getAttribLocation(program, 'position')
+    gl.enableVertexAttribArray(position)
+    gl.vertexAttribPointer(position, 2, gl.FLOAT, false, 0, 0)
+
+    const u = {
+      time: gl.getUniformLocation(program, 'uTime'),
+      mouse: gl.getUniformLocation(program, 'uMouse'),
+      aspect: gl.getUniformLocation(program, 'uAspect'),
+      hover: gl.getUniformLocation(program, 'uHover'),
+      grain: gl.getUniformLocation(program, 'uGrain'),
+    }
+
+    let time = 0
+    let hover = 0
+    const mouse = { x: 0.5, y: 0.5 }
+    const pointer = { x: 0.5, y: 0.5, inside: false }
+    let paused = false
+    let lost = false
+    let drawn = false
+    let rafId = 0
+    let last = 0
+
+    // dt = 0 draws a still frame: time, swirl and mouse stay where they were
+    const draw = (dt: number) => {
+      time += dt
+      const hoverTarget = pointer.inside ? 1 : 0
+      hover += (hoverTarget - hover) * (1 - Math.exp(-dt * HOVER_FADE_SPEED))
+      // Ease toward the pointer instead of jumping; frame-rate independent.
+      // While the swirl is invisible, snap so it starts where the pointer enters.
+      const ease = hover < 0.01 ? 1 : 1 - Math.exp(-dt * MOUSE_FOLLOW_SPEED)
+      mouse.x += (pointer.x - mouse.x) * ease
+      mouse.y += (pointer.y - mouse.y) * ease
+
+      gl.uniform1f(u.time, time)
+      gl.uniform2f(u.mouse, mouse.x, mouse.y)
+      gl.uniform1f(u.aspect, canvas.width / canvas.height)
+      gl.uniform1f(u.hover, hover)
+      gl.uniform1f(u.grain, paused ? GRAIN_STILL : GRAIN_MOVING)
+      gl.drawArrays(gl.TRIANGLES, 0, 3)
+
+      if (!drawn) {
+        drawn = true
+        setReady(true)
+      }
+    }
+
+    const loop = (now: number) => {
+      // Clamp so time doesn't jump after the tab was in the background
+      const dt = last ? Math.min((now - last) / 1000, 0.1) : 0
+      last = now
+      draw(dt)
+      rafId = requestAnimationFrame(loop)
+    }
+    const start = () => {
+      if (rafId || lost || paused) return
+      last = 0
+      rafId = requestAnimationFrame(loop)
+    }
+    const stop = () => {
+      cancelAnimationFrame(rafId)
+      rafId = 0
+    }
+
+    // Pausing stops the loop and redraws once with the lighter still-frame grain
+    setPausedRef.current = (next) => {
+      paused = next
+      if (paused) {
+        stop()
+        if (!lost) draw(0)
+      } else start()
+    }
+
+    const resize = () => {
+      const dpr = Math.min(window.devicePixelRatio || 1, MAX_DPR)
+      canvas.width = Math.max(1, Math.round(canvas.clientWidth * dpr))
+      canvas.height = Math.max(1, Math.round(canvas.clientHeight * dpr))
+      gl.viewport(0, 0, canvas.width, canvas.height)
+      // Resizing clears the canvas: redraw a still frame when the loop isn't running
+      if (!rafId && !lost) draw(0)
+    }
+    const resizeObserver = new ResizeObserver(resize)
+    resizeObserver.observe(canvas)
+
+    const onPointerMove = (event: PointerEvent) => {
+      const rect = canvas.getBoundingClientRect()
+      pointer.x = (event.clientX - rect.left) / rect.width
+      pointer.y = 1 - (event.clientY - rect.top) / rect.height
+      pointer.inside = pointer.x >= 0 && pointer.x <= 1 && pointer.y >= 0 && pointer.y <= 1
+    }
+    const onPointerLeave = () => {
+      pointer.inside = false
+    }
+    window.addEventListener('pointermove', onPointerMove, { passive: true })
+    document.documentElement.addEventListener('pointerleave', onPointerLeave)
+
+    // GPU reset or too many contexts: hand over to the static fallback
+    const onContextLost = () => {
+      lost = true
+      stop()
+      onFail()
+    }
+    canvas.addEventListener('webglcontextlost', onContextLost)
+
+    start()
+
     return () => {
-      root.removeEventListener('pointermove', enter)
-      root.removeEventListener('pointerleave', leave)
+      stop()
+      setPausedRef.current = null
+      resizeObserver.disconnect()
+      window.removeEventListener('pointermove', onPointerMove)
+      document.documentElement.removeEventListener('pointerleave', onPointerLeave)
+      canvas.removeEventListener('webglcontextlost', onContextLost)
+      gl.deleteBuffer(buffer)
+      gl.deleteProgram(program)
+      gl.deleteShader(vs)
+      gl.deleteShader(fs)
     }
-  }, [])
-  // Stable object: R3F copies a new uniforms prop over the old values,
-  // which would reset uTime whenever this component re-renders (e.g. on pause)
-  const uniforms = useMemo(
-    () => ({
-      uTime: { value: 0 },
-      uMouse: { value: new Vector2(0.5, 0.5) },
-      uAspect: { value: 1 },
-      uHover: { value: 0 },
-      uGrain: { value: GRAIN_MOVING },
-    }),
-    []
-  )
+  }, [onFail])
 
-  useFrame((state, delta) => {
-    if (!materialRef.current) return
-
-    // Paused frames (pause itself, resizes) keep everything where it was
-    const dt = paused ? 0 : Math.min(delta, 0.1)
-    const u = materialRef.current.uniforms
-    u.uTime.value += dt
-    u.uAspect.value = state.size.width / state.size.height
-    u.uGrain.value = paused ? GRAIN_STILL : GRAIN_MOVING
-
-    const hoverTarget = pointerInside.current ? 1 : 0
-    u.uHover.value += (hoverTarget - u.uHover.value) * (1 - Math.exp(-dt * HOVER_FADE_SPEED))
-
-    // Ease toward the pointer instead of jumping; frame-rate independent.
-    // While the swirl is invisible, snap so it starts where the pointer enters.
-    const mouse = u.uMouse.value
-    const ease = u.uHover.value < 0.01 ? 1 : 1 - Math.exp(-dt * MOUSE_FOLLOW_SPEED)
-    mouse.x += (state.pointer.x * 0.5 + 0.5 - mouse.x) * ease
-    mouse.y += (state.pointer.y * 0.5 + 0.5 - mouse.y) * ease
-
-    if (!hasRendered.current) {
-      hasRendered.current = true
-      onFirstFrame()
-    }
-  })
+  useEffect(() => {
+    setPausedRef.current?.(paused)
+  }, [paused])
 
   return (
-    <mesh>
-      <planeGeometry args={[2, 2]} />
-      <shaderMaterial
-        ref={materialRef}
-        vertexShader={vertexShader}
-        fragmentShader={fragmentShader}
-        uniforms={uniforms}
+    <>
+      <canvas
+        ref={canvasRef}
+        aria-hidden="true"
+        className={`absolute inset-0 block size-full transition-opacity duration-700 ${ready ? 'opacity-100' : 'opacity-0'}`}
       />
-    </mesh>
+      {ready && (
+        <div className="fixed right-4 bottom-4 flex items-center gap-3 rounded-full bg-white py-1.5 pr-1.5 pl-4 text-sm shadow-md">
+          <span className="text-neutral-600">Background animation</span>
+          <button
+            type="button"
+            onClick={onTogglePause}
+            aria-label={paused ? 'Play background animation' : 'Pause background animation'}
+            className="w-24 rounded-full bg-neutral-900 py-1.5 text-center text-white"
+          >
+            {paused ? '▶ Play' : '⏸ Pause'}
+          </button>
+        </div>
+      )}
+    </>
   )
 }
 
 export default function ShaderCanvas() {
   const reduceMotion = usePrefersReducedMotion()
   const [paused, setPaused] = useState(false)
-  // Shader has drawn its first frame: fade it in over the fallback
-  const [ready, setReady] = useState(false)
-  // WebGL context was lost mid-session (GPU reset, too many tabs): drop the shader
-  const [contextLost, setContextLost] = useState(false)
+  // No WebGL, shader didn't compile, or the context was lost mid-session
+  const [failed, setFailed] = useState(false)
+  const handleFail = useCallback(() => setFailed(true), [])
+  const togglePause = useCallback(() => setPaused((p) => !p), [])
 
   // Fallback2D always stays underneath at the same tree position, so it is never
   // remounted: it is the first paint (SSR), the reduced-motion view, and what
-  // shows if the shader fails or loses its context. The background colour
-  // covers the moment before it first draws.
+  // shows if the shader fails. The background colour covers the moment before
+  // it first draws. The pause bar only appears once the shader has drawn, so it
+  // never shows without an animation.
   return (
     <div className="relative h-full bg-[#FEFAF3]">
       <div className="absolute inset-0">
         <Fallback2D />
       </div>
-      {!reduceMotion && !contextLost && (
-        // On error the boundary renders nothing, removing the shader and the
-        // pause bar together, so the bar never shows without an animation
+      {!reduceMotion && !failed && (
+        // Safety net for anything unexpected thrown while rendering the layer
         <ShaderErrorBoundary>
-          <div
-            className={`absolute inset-0 transition-opacity duration-700 ${ready ? 'opacity-100' : 'opacity-0'}`}
-          >
-            <Canvas
-              fallback={<Fallback2D />}
-              frameloop={paused ? 'demand' : 'always'}
-              dpr={[1, 1.5]}
-              gl={{ antialias: false, depth: false }}
-              onCreated={({ gl }) => {
-                gl.domElement.addEventListener('webglcontextlost', () => setContextLost(true), {
-                  once: true,
-                })
-              }}
-            >
-              <Plane paused={paused} onFirstFrame={() => setReady(true)} />
-            </Canvas>
-          </div>
-          <div className="fixed right-4 bottom-4 flex items-center gap-3 rounded-full bg-white py-1.5 pr-1.5 pl-4 text-sm shadow-md">
-            <span className="text-neutral-600">Background animation</span>
-            <button
-              type="button"
-              onClick={() => setPaused(!paused)}
-              aria-label={paused ? 'Play background animation' : 'Pause background animation'}
-              className="w-24 rounded-full bg-neutral-900 py-1.5 text-center text-white"
-            >
-              {paused ? '▶ Play' : '⏸ Pause'}
-            </button>
-          </div>
+          <ShaderLayer paused={paused} onTogglePause={togglePause} onFail={handleFail} />
         </ShaderErrorBoundary>
       )}
     </div>
