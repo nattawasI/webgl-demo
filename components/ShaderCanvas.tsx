@@ -306,7 +306,7 @@ function ShaderLayer({
             type="button"
             onClick={onTogglePause}
             aria-label={paused ? 'Play background animation' : 'Pause background animation'}
-            className="w-24 rounded-full bg-neutral-900 py-1.5 text-center text-white"
+            className="w-24 cursor-pointer rounded-full bg-neutral-900 py-1.5 text-center text-white"
           >
             {paused ? '▶ Play' : '⏸ Pause'}
           </button>
