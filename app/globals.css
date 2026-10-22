@@ -19,9 +19,12 @@
   }
 }
 
+/* overscroll-behavior stops the mobile bounce and pull-to-refresh when a finger
+   drags across the full-screen shader (the page has nothing to scroll anyway) */
 html, body {
   margin: 0;
   height: 100%;
+  overscroll-behavior: none;
 }
 
 body {
